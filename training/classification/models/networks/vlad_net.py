@@ -1,0 +1,276 @@
+import torch
+import torch.nn as nn
+import math
+from torch.nn.parameter import Parameter
+import torch.functional as F
+from .video_level_models import MoeModel
+import copy
+from torch.autograd import Variable
+from .util import *
+
+
+# init_module = init_NetVLAD()
+# value = init_module.get_tensor('audio_VLAD/cluster_weights')
+# c = 1
+
+class NVLADNet(nn.Module):
+    def __init__(self,
+                 opt = None,
+                 model_input = None,
+                 vocab_size = 3862,
+                 video_size=1024,
+                 audio_size=128,
+                 num_frames = 300,
+                 iterations=100,
+                 add_batch_norm=True,
+                 sample_random_frames=None,
+                 cluster_size=256,
+                 hidden_size=1024,
+                 is_training=True,
+                 use_moe = True,
+                 pretrain = False,
+                 **unused_params):
+        super(NVLADNet, self).__init__()
+
+        iterations = iterations or opt.iterations
+        add_batch_norm = add_batch_norm or opt.netvlad_add_batch_norm
+        # random_frames = sample_random_frames or opt.sample_random_frames
+        self.cluster_size = cluster_size or opt.netvlad_cluster_size
+        self.hidden1_size = hidden_size or opt.netvlad_hidden_size
+        self.video_size = video_size
+        self.audio_size = audio_size
+        if pretrain:
+            self.init_module = init_Module()
+        else:
+            self.init_module = None
+        if False:
+            relu = opt.netvlad_relu
+            dimred = opt.netvlad_dimred
+            self.gating = opt.gating
+            self.remove_diag = opt.gating_remove_diag
+            lightvlad = opt.lightvlad
+            vlagd = opt.vlagd
+        else:
+            relu = False
+            dimred = -1
+            self.gating = True
+            self.remove_diag = False
+            lightvlad = False
+            vlagd = False
+
+        self.num_frames = num_frames
+        self.max_frames = num_frames
+        self.add_batch_norm = add_batch_norm
+        self.relu = relu
+        self.feature_size = video_size + audio_size
+
+        self.video_NetVLAD = NetVLAD(video_size, self.max_frames, cluster_size, add_batch_norm, is_training,init_module=self.init_module,net_type='video_VLAD/')
+
+        if audio_size > 0:
+            self.audio_NetVLAD = NetVLAD(audio_size, self.max_frames, cluster_size / 2, add_batch_norm, is_training,init_module=self.init_module,net_type='audio_VLAD/')
+
+        vlad_dim = self.cluster_size * video_size + cluster_size // 2 * audio_size
+
+        self.hidden1_weights = create_Param((vlad_dim, self.hidden1_size),std = 1 / math.sqrt(self.cluster_size)
+                                            ,init_module=self.init_module,tensor_name='hidden1_weights')
+
+        self.input_bn = bn_layer(self.feature_size)
+        if type(self.init_module) != type(None):
+            self.init_module.init_bn(self.input_bn,'input_bn')
+
+        if self.add_batch_norm and self.relu:
+            self.hidden1_bn = bn_layer(self.hidden1_size)
+        else:
+            self.hidden1_biases = create_Param((self.hidden1_size,),std=0.01
+                                               ,init_module=self.init_module,tensor_name='hidden1_biases')
+
+
+        if self.relu:
+            self.relu6_layer = nn.ReLU6()
+
+        if self.gating:
+            self.gating_weights = create_Param((self.hidden1_size,self.hidden1_size),std=1/math.sqrt(self.hidden1_size)
+                                               ,init_module=self.init_module,tensor_name='gating_weights_2')
+
+            if add_batch_norm:
+                self.gating_bn = bn_layer(self.hidden1_size)
+                if type(self.init_module) != type(None):
+                    self.init_module.init_bn(self.gating_bn, 'gating_bn')
+            else:
+                self.gating_biases = create_Param((self.cluster_size,),std=1 / math.sqrt(feature_size)
+                                                  ,init_module=self.init_module,tensor_name='gating_biases')
+
+            self.sig_layer = nn.Sigmoid()
+
+            if self.remove_diag:
+                pass
+
+        self.use_moe = use_moe
+        if self.use_moe:
+            self.c_layer = MoeModel(opt=None,input_size=hidden_size,vocab_size = vocab_size,is_training = True)
+        else:
+            self.c_layer = nn.Linear(hidden_size,vocab_size)
+
+    def forward(self, reshaped_input):
+        reshaped_input = bn_action(reshaped_input,self.input_bn)
+
+        vlad_video = self.video_NetVLAD(reshaped_input[:,:,0:self.video_size])
+
+        if self.audio_size > 0:
+            vlad_audio = self.audio_NetVLAD(reshaped_input[:,:,self.video_size:])
+            vlad = torch.cat((vlad_video,vlad_audio),dim = 2)
+        else:
+            vlad = vlad_video
+
+        activation = torch.matmul(vlad,self.hidden1_weights)
+
+        if self.add_batch_norm and self.relu:
+            activation = self.hidden1_bn(activation)
+        else:
+            activation += self.hidden1_biases
+
+        if self.relu:
+            activation = self.relu6_layer(activation)
+
+        if self.gating:
+            gates = torch.matmul(activation,self.gating_weights)
+
+            if self.add_batch_norm:
+                gates = bn_action(gates,self.gating_bn)
+            else:
+                gates += self.gating_biases
+
+            gates = self.sig_layer(gates)
+            activation = torch.mul(activation,gates)
+
+        if not self.use_moe:
+            activation = activation.squeeze(1)
+        prob = self.c_layer(activation)
+        return prob
+
+    # def cuda(self,device=None):
+    #     super(NetVLADModelLF, self).cuda()
+    #     self.input_bn.cuda()
+    #     self.video_NetVLAD.cuda()
+    #     self.audio_NetVLAD.cuda()
+    #     #
+    #     if self.add_batch_norm and self.relu:
+    #         self.hidden1_bn.cuda()
+    #     if self.gating:
+    #         if self.add_batch_norm:
+    #             self.gating_bn.cuda()
+    #
+    #     self.c_layer.cuda()
+    #     return self
+
+class NetVLAD(nn.Module):
+    def __init__(self, feature_size, max_frames, cluster_size, add_batch_norm, is_training,init_module = None,net_type = 'video_VLAD'):
+        super(NetVLAD,self).__init__()
+        self.feature_size = feature_size
+        self.max_frames = max_frames
+        self.is_training = is_training
+        self.add_batch_norm = add_batch_norm
+        self.cluster_size = int(cluster_size)
+        print('cluster size ' + str(self.cluster_size))
+        self.init_module = init_module
+
+        self.cluster_weights = create_Param((self.feature_size,self.cluster_size),std=1 / math.sqrt(self.feature_size),
+                                            init_module=self.init_module,tensor_name=net_type + 'cluster_weights')
+
+        if self.add_batch_norm:
+            self.cluster_bn = bn_layer(self.cluster_size)
+            if type(self.init_module) != type(None):
+                self.init_module.init_bn(self.cluster_bn,net_type + 'cluster_bn')
+
+        else:
+            self.cluster_biases = create_Param((self.cluster_size),std = 1 / math.sqrt(self.feature_size))
+
+        self.cluster_weights2 = create_Param((self.feature_size,self.cluster_size),std=1 / math.sqrt(self.feature_size),
+                                             init_module=self.init_module,tensor_name=net_type + 'cluster_weights2')
+
+        self.softmax_layer = nn.Softmax()
+
+    def forward(self, reshaped_input):
+        activation = torch.matmul(reshaped_input,self.cluster_weights)
+
+        if self.add_batch_norm:
+            activation = bn_action(activation,self.cluster_bn)
+        else:
+            activation = self.activation + self.cluster_biases
+
+        activation = self.softmax_layer(activation)
+        activation = activation.view(reshaped_input.shape[0], -1, self.max_frames, self.cluster_size)
+
+        a_sum = torch.sum(activation,keepdim = True,dim = -2)
+        a = torch.mul(a_sum,self.cluster_weights2)
+        activation = activation.permute(0,1,3,2)
+
+        reshaped_input = reshaped_input.view(reshaped_input.shape[0], -1, self.max_frames, self.feature_size)
+        vlad = torch.matmul(activation, reshaped_input)
+        vlad = vlad.permute(0, 1, 3, 2)
+        vlad = vlad - a
+
+        vlad = nn.functional.normalize(vlad, dim=2, p=2)
+
+        vlad = vlad.view(reshaped_input.shape[0], -1, self.cluster_size * self.feature_size)
+        vlad = nn.functional.normalize(vlad, dim=2, p=2)
+
+        return vlad
+
+    # def cuda(self, device=None):
+    #     super(NetVLAD, self).cuda()
+    #     if self.add_batch_norm:
+    #         # self.bn1 = nn.BatchNorm1d(self.max_frames)
+    #         self.cluster_bn.cuda()
+    #     return self
+
+class LightVLAD(nn.Module):
+
+    def __init__(self,feature_size, max_frames, cluster_size, add_batch_norm, is_training):
+        super(LightVLAD, self).__init__()
+        self.feature_size = feature_size
+        self.max_frames = max_frames
+        self.is_training = is_training
+        self.add_batch_norm = add_batch_norm
+        self.cluster_size = cluster_size
+
+        self.fc1 = nn.Linear(self.feature_size,self.cluster_size,bias=False)
+        for p in self.fc1.parameters():
+            torch.nn.init.normal(p,0,1 / math.sqrt(self.feature_size))
+
+        if self.add_batch_norm:
+            self.bn1 = nn.BatchNorm1d(self.max_frames)
+
+        else:
+            self.bias1 = Parameter(torch.Tensor(self.cluster_size))
+            torch.nn.init.normal(self.bias1, 0, 1 / math.sqrt(self.feature_size))
+
+        self.softmax_layer = nn.Softmax()
+        self.fc2 = nn.Linear(self.cluster_size, self.feature_size, bias=False)
+
+    def forward(self, reshaped_input):
+        activation = self.fc1(reshaped_input)
+        if self.add_batch_norm:
+            activation = self.bn1(activation)
+        else:
+            activation = self.activation + self.bias1
+
+        activation = self.softmax_layer(activation)
+        activation = activation.view(reshaped_input.shape[0],-1,self.max_frames,self.cluster_size)
+        activation = activation.permute(0,1,3,2)
+
+        reshaped_input = reshaped_input.view(reshaped_input.shape[0],-1,self.max_frames,self.feature_size)
+        vlad = self.fc2(activation,reshaped_input)
+
+        vlad = vlad.permute(0,1,3,2)
+        vlad = F.norm(vlad,dim=2,p=2)
+
+        return vlad
+
+if __name__ == "__main__":
+    feature = torch.Tensor(5,300,1024 + 128)
+    feature = feature.cuda()
+    net = NVLADNet()
+    net.cuda()
+    # net._parameters['hidden1_weights'].data =
+    s = net(feature)
